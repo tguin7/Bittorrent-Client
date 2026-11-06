@@ -1,274 +1,133 @@
+/* Member 3's file-serving GET implementation, adapted for integration.
+ * Supports the original Member 3 wire format and the team's framed variant:
+ *   GET filename offset length\n      -> exactly 'length' raw bytes
+ *   <GET filename offset length>\n    -> <DATA length>\n + raw bytes
+ * On errors both variants return <GET invalid>\n or <GET missing>\n.
+ * One request per connection, maximum chunk length 1024 bytes.
+ * Member 4's thread_server dispatches concurrent connections and owns fd.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include "peer_server.h"
+#include "net_io.h"
+#include "thread_server.h"
+#include "config.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <string.h>
-#include <limits.h>
-#include <pthread.h>
-#include <errno.h>
-#include <signal.h>
 #include <sys/types.h>
+#include <unistd.h>
 
-//send all requested bytes to peer
-int send_bytes(int skt, const char *data, size_t length)
-{
-	//track bytes sent
-	size_t total = 0;
-
-	//send until all bytes are transmitted
-	while (total < length)
-	{
-		ssize_t sent = send(skt, (data + total), (length - total), MSG_NOSIGNAL);
-
-		if (sent < 0 && errno == EINTR)
-		{ 
-			continue; 
-		}
-
-		//stop sending
-		if (sent <= 0)
-		{
-			return -1; 
-		}
-
-		total += (size_t)sent;
-	}
-
-	return 0;
+static int safe_filename(const char *name) {
+    size_t n = strlen(name);
+    if (!n || n > 180 || name[0] == '.') return 0;
+    for (const unsigned char *p=(const unsigned char *)name; *p; ++p)
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') return 0;
+    return 1;
 }
 
-//1 thread per peer
-void *handle_peer(void *arg)
-{	
-	// retrieve peer socket
-	int client_skt = *(int *)arg;
-
-	free(arg);
-
-	// buffer that stores request
-	char buffer[1024];
-	size_t bytes_rcvd = 0;
-
-	//read request
-	while (bytes_rcvd < sizeof(buffer) - 1)
-	{
-		char ch;
-
-		// receive 1 character at a time
-		ssize_t n = recv(client_skt, &ch, 1, 0);
-
-
-		if (n < 0 && errno == EINTR)
-		{
-			continue;
-		}
-		else if (n <= 0) // peer disconnected or recv fails
-		{
-			goto done;
-		}
-		else if (ch == '\n')
-		{
-			break;
-		}
-		else
-		{
-			// store rcvd char
-			buffer[bytes_rcvd++] = ch;
-		}
-	}
-
-	// reject request that are bigger than buffer
-	if (bytes_rcvd == sizeof(buffer) - 1)
-	{ goto invalid; }
-
-	buffer[bytes_rcvd] = '\0';
-
-	char filename[128];
-	char filepath[256];
-	long long first_byte;
-	long long chunk_size;
-	char extra;
-
-	//extract filename, first byte and chunk size
-	int parsed = sscanf(buffer, "GET %127s %lld %lld %c", filename, &first_byte, &chunk_size, &extra);
-
-	// validate request
-	if (parsed != 3 || first_byte < 0 || first_byte > LONG_MAX || chunk_size <= 0 || chunk_size > 1024 || strchr(filename, '/') != NULL || strchr(filename, '\\') != NULL || strstr(filename, "..") != NULL)
-	{
-		goto invalid;
-	}
-
-	// make path for requested file
-	snprintf(filepath, sizeof(filepath), "shared/%s", filename);
-
-	// open file
-	FILE *file = fopen(filepath, "rb");
-
-
-	if (file == NULL)
-	{	
-		// file didnt open
-		perror("Failed to open file");
-		send_bytes(client_skt, "<GET missing>\n", 14);
-		goto done;
-	}
-	else
-	{
-		// file ptr moved to first byte
-		if (fseek(file, (long)first_byte, SEEK_SET) != 0)
-		{
-			perror("File seek failed");
-			fclose(file);
-			goto invalid;
-		}
-		else
-		{
-			// store req file chunk
-			char file_buffer[1024];
-
-			//read up to chunk size
-			size_t bytes_read = fread(file_buffer, 1, chunk_size, file);
-
-			if (ferror(file))
-			{
-				perror("File read failed");
-				fclose(file);
-				goto done;
-			}
-			else
-			{
-				printf("Peer requested %lld bytes from %s at %lld\n", chunk_size, filename, first_byte);
-
-				// send requested file bytes to peer
-				if (send_bytes(client_skt, file_buffer, bytes_read) == -1)
-				{
-					perror("File send failed");
-				}
-				else
-				{
-					printf("Sent %zu bytes from %s\n", bytes_read, filename);
-				}
-			}
-		fclose(file);
-		goto done;
-	
-		}
-	}
-	// reject invalid req or oversized chunks
-	invalid:
-		send_bytes(client_skt, "<GET invalid>\n", 14);
-		printf("Invalid GET request.\n");
-
-	done:
-		// close connection with peer
-		close(client_skt);
-		return NULL;
+static int decimal(const char *s, uint64_t *out) {
+    if (!s || !*s) return 0;
+    uint64_t val=0;
+    for (; *s; ++s) {
+        if (!isdigit((unsigned char)*s)) return 0;
+        unsigned digit=(unsigned)(*s-'0');
+        if (val > (UINT64_MAX-digit)/10) return 0;
+        val=10*val+digit;
+    }
+    *out=val;
+    return 1;
 }
 
-
-int main(void)
-{
-	// socket file descriptor
-	int server_socket;
-	// store IP information
-	struct sockaddr_in server_addr;
-
-	//prevent terminating on broken sockets
-	signal(SIGPIPE, SIG_IGN);
-
-	// create tcp skt
-	server_socket = socket(AF_INET, SOCK_STREAM, 0);
-
-	if (server_socket == -1)
-	{
-		perror("Failed to create socket");
-		return 1;
-	}
-
-	// server port can be reused after restarting
-	int opt = 1;
-	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
-	{
-		perror("setsockopt failed");
-		close(server_socket);
-		return 1;
-	}
-
-	//clear server structure 
-	memset(&server_addr, 0, sizeof(server_addr));
-
-	//configure IP, port and interface
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(5001);
-	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-	if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
-	{
-		perror("Bind failed");
-		close(server_socket);
-		return 1;
-	}
-	printf("Socket bound to port 5001\n");
-	
-
-	if (listen(server_socket, 10) == -1)
-	{
-		perror("Listen failed");
-		close(server_socket);
-		return 1;
-	}
-
-	printf("Peer server listening on port 5001 \n");
-
-	while (1)
-	{
-		// store info about peer
-		struct sockaddr_in client_addr;
-		socklen_t client_len = sizeof(client_addr);
-
-		//wait and accept incoming TCP connection
-		int client_skt = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
-
-		//for connection errors
-		if (client_skt == -1)
-		{
-			if (errno == EINTR)
-			{ continue; }
-			printf("Accept failed");
-			continue;
-		}
-
-		printf("A peer connected\n");
-
-		// memory for peer skt descriptor
-		int *skt_ptr = malloc(sizeof(int));
-
-		if (skt_ptr == NULL)
-		{
-			perror("Memory allocation failed");
-			close(client_skt);
-			continue;
-		}
-
-		// store skt in memory
-		*skt_ptr = client_skt;
-
-		//new thread for connected peer
-		pthread_t thread_id;
-
-		if (pthread_create(&thread_id, NULL, handle_peer, skt_ptr) != 0)
-		{
-			fprintf(stderr, "thread creation failed\n");
-			free(skt_ptr);
-			close(client_skt);
-			continue;
-		}
-
-		pthread_detach(thread_id);
-	}
-
-	close(server_socket);
-
-	return 0;
+static void send_error(int fd, const char *text) {
+    (void)net_send_all(fd,text,strlen(text));
 }
+
+void peer_serve_connection(int fd, void *shared_dir_context) {
+    const char *shared_dir=(const char *)shared_dir_context;
+    if (!shared_dir || !*shared_dir) return;
+    char request[512];
+    ssize_t size=net_recv_line(fd,request,sizeof request);
+    if (size < 0) {
+        send_error(fd,"<GET invalid>\n");
+        return;
+    }
+    if (request[size-1] != '\n') { send_error(fd,"<GET invalid>\n"); return; }
+    request[size-1]='\0';
+    int framed=request[0]=='<';
+    char *body=request;
+    if (framed) {
+        size_t end=strlen(request);
+        if (end < 2 || request[end-1] != '>') {
+            send_error(fd,"<GET invalid>\n"); return;
+        }
+        request[end-1]='\0';
+        body=request+1;
+    }
+    char *parts[5]={0};
+    char *save=NULL;
+    unsigned count=0;
+    for (char *p=strtok_r(body," \t\r",&save); p; p=strtok_r(NULL," \t\r",&save)) {
+        if (count >= 4) { count=5; break; }
+        parts[count++]=p;
+    }
+    uint64_t offset=0, length=0;
+    if (count != 4 || strcmp(parts[0],"GET") || !safe_filename(parts[1]) ||
+        !decimal(parts[2],&offset) || !decimal(parts[3],&length) ||
+        length == 0 || length > 1024 || offset > INT64_MAX ||
+        offset > UINT64_MAX-length) {
+        send_error(fd,"<GET invalid>\n"); return;
+    }
+    char path[4096];
+    int n=snprintf(path,sizeof path,"%s/%s",shared_dir,parts[1]);
+    if (n < 0 || (size_t)n >= sizeof path) { send_error(fd,"<GET invalid>\n"); return; }
+    FILE *file=fopen(path,"rb");
+    if (!file) { send_error(fd,"<GET missing>\n"); return; }
+    if (fseeko(file,(off_t)offset,SEEK_SET) != 0) {
+        fclose(file); send_error(fd,"<GET invalid>\n"); return;
+    }
+    unsigned char chunk[1024];
+    size_t got=fread(chunk,1,(size_t)length,file);
+    int read_error=ferror(file);
+    fclose(file);
+    if (read_error || got != (size_t)length) {
+        send_error(fd,"<GET invalid>\n"); return;
+    }
+    if (framed) {
+        char header[32];
+        int h=snprintf(header,sizeof header,"<DATA %zu>\n",got);
+        if (h <= 0 || net_send_all(fd,header,(size_t)h) != 0) return;
+    }
+    if (net_send_all(fd,chunk,got) == 0) {
+        fprintf(stdout,"[peerServer] Served %s offset=%" PRIu64 " length=%zu mode=%s\n",
+                parts[1],offset,got,framed?"framed":"legacy");
+        fflush(stdout);
+    }
+}
+
+#ifdef PEER_SERVER_STANDALONE
+static volatile sig_atomic_t stop_requested=0;
+static void stop_handler(int sig) { (void)sig; stop_requested=1; }
+int main(int argc, char **argv) {
+    const char *cfg=argc>=2?argv[1]:"serverThreadConfig.cfg";
+    server_config_t c;
+    if (config_read_server(cfg,&c) != 0) { perror(cfg); return 1; }
+    signal(SIGINT,stop_handler);
+    signal(SIGTERM,stop_handler);
+    thread_server_options_t opts={.bind_ip="0.0.0.0",.port=c.listen_port,
+        .max_clients=64,.io_timeout_ms=5000,.backlog=64};
+    printf("Peer server listening on port %u, shared directory %s\n",
+            (unsigned)c.listen_port,c.shared_dir);
+    fflush(stdout);
+    if (thread_server_run(&opts,peer_serve_connection,c.shared_dir,&stop_requested)<0) {
+        perror("peer server");return 1;
+    }
+    return 0;
+}
+#endif
