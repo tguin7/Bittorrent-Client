@@ -1,0 +1,37 @@
+CS 4390 (Section 501) — Member 4 integrated build validation
+Date: November 5, 2026 (America/Chicago)
+Platform: Linux development container (not a physical two-machine or Ubuntu WSL2 run)
+
+Commands:
+    bash scripts/verify_integration.sh
+    make test-integration
+
+Verification results:
+    Clean build with -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread: PASS
+    Member 4 C download-pool tests: PASS
+    Member 4 C TCP I/O tests: PASS
+    Member 4 Python infrastructure tests: 12 / 12 PASS
+    Unmodified Member 2 peer.py client tests: 13 / 13 PASS
+    New integration tests: 8 / 8 PASS
+
+New integration test coverage:
+  - tracker LIST, createtracker, updatetracker, GET filename.track
+  - correct tracker metadata MD5 and peer.c metadata validation
+  - automatic real file download by a different peer and completed-file MD5
+  - thread-based concurrent binary chunk requests (4 workers)
+  - simultaneous downloads by peer2 and peer3 from one seed
+  - Member 3's original legacy downloader still transfers correctly
+  - original raw GET and integrated framed GET/DATA both work
+  - >1024-byte requests, invalid filename, absent file error responses
+  - fragmented tracker requests
+  - replacement rather than duplication of tracker peer records
+  - best-effort interrupted chunk recovery with a validated state header
+  - re-advertising a completed download via updatetracker
+
+Existing peer.c SHA256 (verified unchanged):
+826e259ee2f978b62fb0488e0288586fe96fa5497b40d67ec66dd0288f589a64
+
+IMPORTANT: The two-machine physical networking demonstration has NOT been performed
+in this environment. It requires two networked computers with working IP routing,
+firewall rules, and the configured TCP ports open. The instructor's 1–2-page
+midterm report and screenshots still need to be prepared.
