@@ -336,7 +336,12 @@ int main() {
         return 1;
     }
     // Port on line 1, Directory on line 2
-    fscanf(config, "%d\n%255s", &server_port, shared_dir);
+    if (fscanf(config, "%d\n%255s", &server_port, shared_dir) != 2)
+    {
+        fprintf(stderr, "Error reading sconfig");
+        fclose(config);
+        return 1;
+    }
     fclose(config);
     
     // Ensure the shared directory exists
